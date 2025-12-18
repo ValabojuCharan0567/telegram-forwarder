@@ -9,6 +9,10 @@ import urllib.parse
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.types import (
+    MessageMediaPhoto,
+    MessageMediaDocument,
+)
 from dotenv import load_dotenv
 
 # ---------------- LOAD ENV ---------------- #
@@ -88,14 +92,12 @@ def remove_urls(text: str) -> str:
 def clean_url(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
 
-    # Amazon
     if "amazon." in parsed.netloc:
         parts = parsed.path.split("/")
         if "dp" in parts:
             asin = parts[parts.index("dp") + 1]
             return f"https://www.amazon.in/dp/{asin}"
 
-    # Flipkart
     if "flipkart." in parsed.netloc:
         q = urllib.parse.parse_qs(parsed.query)
         if "pid" in q:
@@ -179,24 +181,19 @@ async def handler(event):
         if not text:
             return
 
-        # Quality filter
         if score_message(text) < MIN_SCORE:
             return
 
-        # Duplicate filter
         if is_duplicate(text):
             return
 
-        # Extract & clean URLs
         urls = extract_urls(text)
         clean_urls = [clean_url(u) for u in urls]
 
-        # Price logic
         price = extract_price(text)
         key = clean_urls[0] if clean_urls else text[:60]
         price_note = price_trend(key, price) if price else ""
 
-        # AI rewrite
         rewritten = await rewrite_with_local_llm(text)
         rewritten = remove_urls(rewritten)
 
@@ -210,7 +207,8 @@ async def handler(event):
             inject_smart_emojis(rewritten)
         ) + FOOTER
 
-        if msg.media:
+        # ✅ SAFE MEDIA HANDLING (FIXED)
+        if isinstance(msg.media, (MessageMediaPhoto, MessageMediaDocument)):
             await client.send_file(
                 TARGET_CHANNEL,
                 msg.media,
@@ -221,15 +219,16 @@ async def handler(event):
             await client.send_message(
                 TARGET_CHANNEL,
                 final_text,
-                parse_mode="md"
+                parse_mode="md",
+                link_preview=False
             )
 
-        print("✅ Posted cleanly (no duplicate links)")
+        print("✅ Posted cleanly (safe media handling)")
 
     except Exception as e:
         print("Error:", e)
 
 # ---------------- RUN ---------------- #
-print("🚀 Bot running — FINAL CLEAN VERSION")
+print("🚀 Bot running — FINAL CLEAN VERSION (NO MEDIA ERRORS)")
 client.start()
 client.run_until_disconnected()
