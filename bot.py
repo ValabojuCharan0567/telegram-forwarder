@@ -1,57 +1,61 @@
 import os
 import re
-import json
 import time
+import json
 import hashlib
 import random
 import aiohttp
 from dotenv import load_dotenv
-
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from telegram.helpers import escape_markdown
 
-# ---------------- ENV ---------------- #
+# ---------- ENV ----------
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OLLAMA_URL = os.getenv("OLLAMA_URL")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing")
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY is missing")
 
 TARGET_CHANNEL = "@ExtraPeBot"
 
-SOURCE_CHANNELS = [
+SOURCE_CHANNELS = {
     "iamprasadtech",
     "extrape",
     "TechFactsDeals",
     "charan0678"
-]
+}
 
 FOOTER = "\n\n—\n📢 *Follow @TechLabDaily*"
+CTAS = ["📤 Share with friends", "👀 Worth checking", "🔖 Save this deal"]
 
-DEDUP_FILE = "seen.json"
-PRICE_FILE = "prices.json"
+SEEN_FILE = "seen.json"
 
-SEEN = json.load(open(DEDUP_FILE)) if os.path.exists(DEDUP_FILE) else {}
-PRICE_DB = json.load(open(PRICE_FILE)) if os.path.exists(PRICE_FILE) else {}
+# ---------- STATE ----------
+def load_seen():
+    try:
+        with open(SEEN_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {}
 
-# ---------------- HELPERS ---------------- #
-def score_message(text):
-    t = text.lower()
-    score = 0
-    if any(x in t for x in ["₹", "rs", "%", "http"]): score += 3
-    if any(x in t for x in ["deal", "offer", "discount"]): score += 2
-    if len(t) < 20: score -= 3
-    return score
+SEEN = load_seen()
 
-def is_duplicate(text):
+# ---------- HELPERS ----------
+def is_duplicate(text: str) -> bool:
     h = hashlib.md5(text.encode()).hexdigest()
-    if h in SEEN: return True
-    SEEN[h] = time.time()
-    json.dump(SEEN, open(DEDUP_FILE, "w"))
+    if h in SEEN:
+        return True
+    SEEN[h] = int(time.time())
+    try:
+        with open(SEEN_FILE, "w") as f:
+            json.dump(SEEN, f)
+    except:
+        pass
     return False
 
 def extract_urls(text):
@@ -63,61 +67,64 @@ def clean_amazon(url):
         return f"https://www.amazon.in/dp/{asin}"
     return url
 
-def extract_price(text):
-    m = re.search(r"(₹|rs\.?)\s?([\d,]+)", text.lower())
-    return int(m.group(2).replace(",", "")) if m else None
-
-def price_note(key, price):
-    old = PRICE_DB.get(key)
-    PRICE_DB[key] = price
-    json.dump(PRICE_DB, open(PRICE_FILE, "w"))
-    if not old: return "🆕 First time deal"
-    if price < old: return f"🔻 Price dropped (was ₹{old})"
-    return ""
-
-async def rewrite_with_ai(text):
-    if not OLLAMA_URL:
-        return text
-    payload = {
-        "model": "mistral",
-        "prompt": f"Rewrite clean Telegram deal message without URLs:\n{text}",
-        "stream": False
+async def rewrite_with_groq(text: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
     }
+
+    payload = {
+        "model": "llama3-8b-8192",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Rewrite Telegram deal posts cleanly with emojis. Do not include links."
+            },
+            {
+                "role": "user",
+                "content": text
+            }
+        ],
+        "temperature": 0.6
+    }
+
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(OLLAMA_URL, json=payload, timeout=15) as r:
-                j = await r.json()
-                return j.get("response", text)
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload
+            ) as r:
+                if r.status != 200:
+                    return text
+                data = await r.json()
+                return data["choices"][0]["message"]["content"].strip()
     except:
-        return text
+        return text  # SAFE FALLBACK
 
-CTAS = ["📤 Share with friends", "🔖 Save this", "👀 Worth checking"]
-
-# ---------------- HANDLER ---------------- #
+# ---------- HANDLER ----------
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     chat = update.effective_chat
 
-    if chat.username not in SOURCE_CHANNELS:
+    if not chat.username or chat.username not in SOURCE_CHANNELS:
         return
 
     text = msg.text or msg.caption
-    if not text: return
-    if score_message(text) < 3: return
-    if is_duplicate(text): return
+    if not text:
+        return
+
+    if is_duplicate(text):
+        return
 
     urls = [clean_amazon(u) for u in extract_urls(text)]
-    price = extract_price(text)
-    note = price_note(urls[0] if urls else text[:50], price) if price else ""
-
-    rewritten = await rewrite_with_ai(text)
+    rewritten = await rewrite_with_groq(text)
     rewritten = re.sub(r"https?://\S+", "", rewritten).strip()
 
-    if note:
-        rewritten = f"{note}\n\n{rewritten}"
+    rewritten = escape_markdown(rewritten, version=2)
 
     if urls:
-        rewritten += "\n\n🛒 Buy here:\n" + "\n".join(urls)
+        rewritten += "\n\n🛒 *Buy here:*\n" + "\n".join(urls)
 
     final = rewritten + "\n\n" + random.choice(CTAS) + FOOTER
 
@@ -126,19 +133,19 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=TARGET_CHANNEL,
             photo=msg.photo[-1].file_id,
             caption=final,
-            parse_mode="Markdown"
+            parse_mode="MarkdownV2"
         )
     else:
         await context.bot.send_message(
             chat_id=TARGET_CHANNEL,
             text=final,
-            parse_mode="Markdown",
+            parse_mode="MarkdownV2",
             disable_web_page_preview=True
         )
 
-# ---------------- RUN ---------------- #
+# ---------- RUN ----------
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(MessageHandler(filters.ALL, on_message))
 
-print("🚀 Bot API version running (Railway-safe)")
+print("🚀 Bot running with Groq AI (Cloud-only, Stable)")
 app.run_polling()
